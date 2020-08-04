@@ -3,7 +3,7 @@
 
 local bit = require "bit"
 local sub = string.sub
-local tcp = ngx.socket.tcp
+local tcp = require "resty.socket"
 local strbyte = string.byte
 local strchar = string.char
 local strfind = string.find
@@ -22,14 +22,7 @@ local unpack = unpack
 local setmetatable = setmetatable
 local error = error
 local tonumber = tonumber
-
-
-if not ngx.config
-   or not ngx.config.ngx_lua_version
-   or ngx.config.ngx_lua_version < 9011
-then
-    error("ngx_lua 0.9.11+ required")
-end
+local gmatch = string.gmatch
 
 
 local ok, new_tab = pcall(require, "table.new")
@@ -252,7 +245,7 @@ local function _recv_packet(self)
 
     local data, err = sock:receive(4) -- packet header
     if not data then
-        return nil, nil, "failed to receive packet header: " .. err
+        return nil, nil, "failed to receive packet header: " .. tostring(err)
     end
 
     --print("packet header: ", _dump(data))
@@ -516,8 +509,8 @@ local function _recv_field_packet(self)
 end
 
 
-function _M.new(self)
-    local sock, err = tcp()
+function _M.new(self, socket_type)
+    local sock, err = tcp.tcp(socket_type)
     if not sock then
         return nil, err
     end
@@ -687,7 +680,7 @@ function _M.connect(self, opts)
             return nil, "failed to send client authentication packet: " .. err
         end
 
-        local ok, err = sock:sslhandshake(false, nil, ssl_verify)
+        local ok, err = sock:sslhandshake(false, nil, ssl_verify, opts)
         if not ok then
             return nil, "failed to do ssl handshake: " .. (err or "")
         end
@@ -745,6 +738,14 @@ end
 
 
 function _M.set_keepalive(self, ...)
+    -- ngx.socket keepalive function keeps idle connections in its poll
+    -- for a maximal idle timeout. MariaDB reports an aborted connection warning
+    -- when the connection timeout is reached. It looks like ngx.socket
+    -- does not send a necessary package to close the connection correctly or
+    -- something like that. Thus these warnings are false positive.
+    -- The correct way to close the connection is preseneted in a mysql#close()
+    -- method. It sends a COM_QUIT package before closing the connection -
+    -- without it MariaDB reports warnings mentioned above.
     local sock = self.sock
     if not sock then
         return nil, "not initialized"
@@ -792,6 +793,20 @@ function _M.server_ver(self)
 end
 
 
+local function to_sql_string(self, sql_table)
+    local head = sql_table[1]
+    local body = sql_table[2]
+    local tail = sql_table[3]
+
+    local queries = ""
+    for value in gmatch(body, "([^,]+)") do
+        queries = queries .. head .. " " .. value .. tail
+    end
+
+    return queries
+end
+
+
 local function send_query(self, query)
     if self.state ~= STATE_CONNECTED then
         return nil, "cannot send query in the current context: "
@@ -804,6 +819,14 @@ local function send_query(self, query)
     end
 
     self.packet_no = -1
+
+    if type(query) == "table" then
+        query = to_sql_string(self, query)
+    end
+
+    -- By default MariaDB removes backslash during data insert.
+    -- This fix ensure that escaped characters are stored correctly.
+    query = query:gsub("\\", "\\\\")
 
     local cmd_packet = strchar(COM_QUERY) .. query
     local packet_len = 1 + #query
